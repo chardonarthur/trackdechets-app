@@ -37,7 +37,7 @@ BSD_TYPE_COLUMN_CANDIDATES = [
     "type",
 ]
 
-DEFAULT_START_DATE = dt.date(2000, 1, 1)
+DEFAULT_START_DATE = dt.date(2001, 1, 1)
 
 
 def default_date_range() -> tuple[dt.date, dt.date]:
@@ -146,6 +146,8 @@ def app_style() -> None:
 
 
 
+
+
 def main() -> None:
     st.set_page_config(page_title="Export BSD", layout="centered")
     app_style()
@@ -156,64 +158,61 @@ def main() -> None:
     st.markdown(
         """
         <div class="hero">
-          <small>Trackdéchets - registre réglementaire</small>
-          <h1>Export BSD pour comptabilité</h1>
-          <p>Générez un export réglementaire (XLSX) pour vos clients en quelques clics.</p>
+          <small>Trackdechets - registre reglementaire</small>
+          <h1>Export BSD pour comptabilite</h1>
+          <p>Generez un export reglementaire (XLSX) pour vos clients en quelques clics.</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
+
+    token = st.text_input("Jeton Trackdechets (Bearer)", type="password")
+    if not token:
+        st.info("Renseignez le jeton pour continuer.")
+        return
+
     if "companies" not in st.session_state:
         st.session_state.companies = []
+    if "companies_token" not in st.session_state:
+        st.session_state.companies_token = ""
+    if "registry_cache" not in st.session_state:
+        st.session_state.registry_cache = {}
+    if "last_export_by_type" not in st.session_state:
+        st.session_state.last_export_by_type = {}
 
-    if "last_export" not in st.session_state:
-        st.session_state.last_export = {}
+    st.subheader("Etablissement")
+    st.caption("Liste chargee automatiquement depuis votre jeton.")
 
-    st.caption("Chargement automatique des etablissements accessibles via ce jeton.")
+    if st.session_state.companies_token != token:
+        st.session_state.companies = []
+        st.session_state.registry_cache = {}
+        st.session_state.companies_token = token
 
-    if token:
-        if st.session_state.get("companies_token") != token:
-            st.session_state.companies = []
-            st.session_state.companies_token = token
-        if not st.session_state.companies:
-            client = TrackdechetsClient(token)
-            try:
-                st.session_state.companies = client.list_my_companies()
-            except TrackdechetsError as exc:
-                st.error(f"Erreur Trackdechets: {exc}")
+    if not st.session_state.companies:
+        client = TrackdechetsClient(token)
+        try:
+            st.session_state.companies = client.list_my_companies()
+        except TrackdechetsError as exc:
+            st.error(f"Erreur Trackdechets: {exc}")
+            return
 
     company_map = {
-        f"{company.name} — {company.siret}": company.siret
+        f"{company.name} - {company.siret}": company.siret
         for company in st.session_state.companies
     }
     company_options = list(company_map.keys())
     selected_company = st.selectbox(
-        "Établissement (SIRET)",
+        "Etablissement (SIRET)",
         options=company_options,
         index=None,
-        placeholder="Sélectionner un établissement",
+        placeholder="Selectionner un etablissement",
     )
     siret = ""
     if selected_company:
         siret = company_map.get(selected_company, "")
 
-    if token and not st.session_state.companies:
-        st.warning("Aucun etablissement trouve pour ce jeton.")
-
-    with st.form("inputs"):
-        st.caption("Periode appliquee: depuis le 01/01/2000 jusqu'a aujourd'hui.")
-        registry_label = st.selectbox("Registre", list(REGISTRY_TYPES.keys()))
-        all_types = st.checkbox("Tous les types de BSD", value=True)
-        selected_types = st.multiselect(
-            "Selectionner les types",
-            BSD_TYPES,
-            default=BSD_TYPES,
-            disabled=all_types,
-        )
-        submit_full = st.form_submit_button("Exporter le registre complet")
-        submit = st.form_submit_button("Exporter le registre")
-    if not token or not siret:
-        st.info("Renseignez le jeton puis selectionnez un etablissement pour continuer.")
+    if not siret:
+        st.info("Selectionnez un etablissement pour continuer.")
         return
 
     if len(siret) != 14 or not siret.isdigit():
@@ -222,21 +221,22 @@ def main() -> None:
 
     client = TrackdechetsClient(token)
 
-    if submit_full:
-        all_types = True
-        selected_types = BSD_TYPES
-        submit = True
+    full_start = DEFAULT_START_DATE
+    full_end = dt.date.today()
+    start_iso = to_iso_datetime(full_start, end_of_day=False)
+    end_iso = to_iso_datetime(full_end, end_of_day=True)
+    cache_prefix = f"{siret}|{start_iso}|{end_iso}"
 
-    if submit:
-        start_date = DEFAULT_START_DATE
-        end_date = dt.date.today()
-        start_iso = to_iso_datetime(start_date, end_of_day=False)
-        end_iso = to_iso_datetime(end_date, end_of_day=True)
-        registry_type = REGISTRY_TYPES[registry_label]
-        reuse_download = False
+    def fetch_registry(registry_type: str) -> dict:
+        cache_key = f"{cache_prefix}|{registry_type}"
+        if cache_key in st.session_state.registry_cache:
+            return st.session_state.registry_cache[cache_key]
+
+        label = "entrant" if registry_type == "INCOMING" else "sortant"
         file_bytes = None
+        reuse_download = False
 
-        with st.spinner("Génération du registre réglementaire..."):
+        with st.spinner(f"Preparation du registre {label}..."):
             try:
                 export = client.generate_registry_export(
                     registry_type=registry_type,
@@ -247,46 +247,41 @@ def main() -> None:
             except TrackdechetsError as exc:
                 message = str(exc)
                 if "moins de 5 minutes" in message:
-                    last_export = st.session_state.get("last_export", {})
+                    last_export = st.session_state.last_export_by_type.get(registry_type, {})
                     if (
                         last_export.get("siret") == siret
-                        and last_export.get("registry_type") == registry_type
                         and last_export.get("start") == start_iso
                         and last_export.get("end") == end_iso
                         and last_export.get("id")
                     ):
-                        st.info("Export recent detecte. Recuperation du dernier fichier...")
+                        st.info("Export recent detecte. Recuperation du fichier...")
                         try:
                             download_url = client.get_registry_export_download_url(last_export["id"])
                             file_bytes = client.download_file(download_url)
                             reuse_download = True
+                            export = type("Export", (), {"export_id": last_export["id"], "status": "SUCCESSFUL"})
                         except TrackdechetsError as download_exc:
-                            st.warning("Export deja genere il y a moins de 5 minutes. Attendez quelques minutes puis reessayez.")
                             st.error(f"Erreur Trackdechets: {download_exc}")
-                            return
-                        export = type("Export", (), {"export_id": last_export["id"], "status": "SUCCESSFUL"})
+                            return {"error": True}
                     else:
-                        st.warning("Export deja genere il y a moins de 5 minutes. Attendez quelques minutes puis reessayez.")
-                        return
+                        st.warning("Export deja genere il y a moins de 5 minutes. Attendez puis reessayez.")
+                        return {"error": True}
                 else:
                     st.error(f"Erreur Trackdechets: {exc}")
-                    return
+                    return {"error": True}
 
         if not export.export_id:
             st.error("Impossible de lancer l'export.")
-            return
+            return {"error": True}
 
-        st.session_state.last_export = {
+        st.session_state.last_export_by_type[registry_type] = {
             "id": export.export_id,
             "siret": siret,
-            "registry_type": registry_type,
             "start": start_iso,
             "end": end_iso,
         }
 
-        if reuse_download and file_bytes is not None:
-            status = "SUCCESSFUL"
-        else:
+        if not reuse_download:
             status_placeholder = st.empty()
             status = export.status
             start_time = time.time()
@@ -294,55 +289,124 @@ def main() -> None:
             while status not in {"SUCCESSFUL", "FAILED", "CANCELED"}:
                 if time.time() - start_time > timeout_seconds:
                     st.error("L'export met trop de temps. Reessayez dans quelques minutes.")
-                    return
-                status_placeholder.info(f"Export en cours... ({status})")
+                    return {"error": True}
+                status_placeholder.info("Export en cours sur Trackdechets...")
                 time.sleep(5)
                 try:
                     status = client.get_registry_export_status(export.export_id)
                 except TrackdechetsError as exc:
                     st.error(f"Erreur Trackdechets: {exc}")
-                    return
+                    return {"error": True}
             if status in {"FAILED", "CANCELED"}:
                 st.error("L'export a echoue cote Trackdechets.")
-                return
+                return {"error": True}
             try:
                 download_url = client.get_registry_export_download_url(export.export_id)
                 file_bytes = client.download_file(download_url)
             except TrackdechetsError as exc:
                 st.error(f"Erreur Trackdechets: {exc}")
-                return
+                return {"error": True}
 
-        filename = f"registre_{registry_type.lower()}_{siret}_{start_date}_{end_date}.xlsx"
-        filtered_notice = ""
         df = None
-
         try:
             df = pd.read_excel(io.BytesIO(file_bytes))
         except Exception:
             df = None
 
-        if df is not None and df.empty:
-            st.warning("Aucun BSD trouvé sur la période.")
+        rows = len(df) if df is not None else 0
+        payload = {
+            "bytes": file_bytes,
+            "rows": rows,
+            "registry_type": registry_type,
+            "df": df,
+        }
+        st.session_state.registry_cache[cache_key] = payload
+        return payload
 
-        if not all_types and selected_types and df is not None:
-            filtered = filter_by_bsd_type(df, selected_types)
-            if len(filtered) != len(df):
-                filtered_notice = " (filtré par type de BSD)"
-            elif len(filtered) == len(df):
-                st.warning("Impossible de filtrer par type: colonne de type BSD non trouvée.")
-            buffer = io.BytesIO()
+    st.subheader("Registres")
+    col_in, col_out = st.columns(2)
+
+    with col_in:
+        incoming = fetch_registry("INCOMING")
+        if incoming.get("error"):
+            st.error("Registre entrant indisponible.")
+        else:
+            st.metric("Registre entrant", incoming.get("rows", 0))
+
+    with col_out:
+        outgoing = fetch_registry("OUTGOING")
+        if outgoing.get("error"):
+            st.error("Registre sortant indisponible.")
+        else:
+            st.metric("Registre sortant", outgoing.get("rows", 0))
+
+    if incoming.get("error") or outgoing.get("error"):
+        return
+
+    st.subheader("Export")
+    export_start, export_end = st.date_input(
+        "Periode d'export",
+        value=(full_start, full_end),
+        format="DD/MM/YYYY",
+    )
+
+    if export_start > export_end:
+        st.error("La date de debut doit preceder la date de fin.")
+        return
+
+    def filter_by_date(df: pd.DataFrame, start_date: dt.date, end_date: dt.date) -> pd.DataFrame:
+        if df is None or df.empty:
+            return df
+        candidates = [
+            "date",
+            "date de creation",
+            "date de reception",
+            "date de prise en charge",
+            "date d'envoi",
+            "date d'emission",
+            "createdat",
+            "date creation",
+        ]
+        normalized = {col.strip().lower(): col for col in df.columns}
+        date_col = None
+        for candidate in candidates:
+            if candidate in normalized:
+                date_col = normalized[candidate]
+                break
+        if not date_col:
+            return df
+        series = pd.to_datetime(df[date_col], errors="coerce")
+        mask = (series.dt.date >= start_date) & (series.dt.date <= end_date)
+        return df.loc[mask]
+
+    col_in_exp, col_out_exp = st.columns(2)
+
+    with col_in_exp:
+        df_in = incoming.get("df")
+        filtered_in = filter_by_date(df_in, export_start, export_end)
+        filename = f"registre_entrant_{siret}_{export_start}_{export_end}.xlsx"
+        buffer = io.BytesIO()
+        if filtered_in is not None:
             with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-                filtered.to_excel(writer, index=False, sheet_name="Registre")
-            file_bytes = buffer.getvalue()
-
-        if not file_bytes:
-            st.error("Fichier vide. Vérifiez la période ou le SIRET.")
-            return
-
-        st.success(f"Export prêt{filtered_notice}.")
+                filtered_in.to_excel(writer, index=False, sheet_name="Registre")
         st.download_button(
-            label="Télécharger le registre (XLSX)",
-            data=file_bytes,
+            label="Exporter registre entrant",
+            data=buffer.getvalue(),
+            file_name=filename,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    with col_out_exp:
+        df_out = outgoing.get("df")
+        filtered_out = filter_by_date(df_out, export_start, export_end)
+        filename = f"registre_sortant_{siret}_{export_start}_{export_end}.xlsx"
+        buffer = io.BytesIO()
+        if filtered_out is not None:
+            with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+                filtered_out.to_excel(writer, index=False, sheet_name="Registre")
+        st.download_button(
+            label="Exporter registre sortant",
+            data=buffer.getvalue(),
             file_name=filename,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
